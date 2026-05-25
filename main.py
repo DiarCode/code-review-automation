@@ -19,7 +19,6 @@ import re
 import sys
 import json
 import argparse
-import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -77,6 +76,7 @@ def parse_pr_url(url: str) -> tuple[str, str, int]:
 
 class GitHubClient:
     BASE = "https://api.github.com"
+    DEFAULT_TIMEOUT = 60
 
     def __init__(self, token: str):
         self.session = requests.Session()
@@ -92,7 +92,7 @@ class GitHubClient:
 
     def get(self, path: str, params: dict = None) -> dict | list:
         url = f"{self.BASE}{path}"
-        resp = self.session.get(url, params=params)
+        resp = self.session.get(url, params=params, timeout=self.DEFAULT_TIMEOUT)
         if resp.status_code == 401:
             print("❌  GitHub API: Unauthorized. Check your GITHUB_TOKEN.")
             sys.exit(1)
@@ -119,15 +119,73 @@ class GitHubClient:
             page += 1
         return results
 
-    def get_diff(self, owner: str, repo: str, pr: int) -> str:
-        """Fetch the raw unified diff for a PR."""
+    def _is_diff_too_large(self, resp: requests.Response) -> bool:
+        if resp.status_code != 406:
+            return False
+        try:
+            payload = resp.json()
+        except ValueError:
+            return False
+
+        for err in payload.get("errors", []):
+            if err.get("field") == "diff" and err.get("code") == "too_large":
+                return True
+        return False
+
+    def _get_pr_diff(self, owner: str, repo: str, pr: int) -> str:
+        """Fetch unified diff from pull request media type."""
         url = f"{self.BASE}/repos/{owner}/{repo}/pulls/{pr}"
         resp = self.session.get(url, headers={
             **self.session.headers,
             "Accept": "application/vnd.github.v3.diff"
-        })
+        }, timeout=self.DEFAULT_TIMEOUT)
         resp.raise_for_status()
         return resp.text
+
+    def _get_compare_diff(self, owner: str, repo: str, base_sha: str, head_sha: str) -> str:
+        """Fetch unified diff from compare endpoint."""
+        url = f"{self.BASE}/repos/{owner}/{repo}/compare/{base_sha}...{head_sha}"
+        resp = self.session.get(url, headers={
+            **self.session.headers,
+            "Accept": "application/vnd.github.v3.diff"
+        }, timeout=self.DEFAULT_TIMEOUT)
+        resp.raise_for_status()
+        return resp.text
+
+    def get_diff(
+        self,
+        owner: str,
+        repo: str,
+        pr: int,
+        *,
+        base_sha: str | None = None,
+        head_sha: str | None = None,
+        files: list[dict] | None = None,
+    ) -> tuple[str, str]:
+        """
+        Fetch raw unified diff for a PR.
+
+        Returns:
+            (diff_text, diff_source)
+        """
+        try:
+            return self._get_pr_diff(owner, repo, pr), "pull_request_media_type"
+        except requests.HTTPError as err:
+            if err.response is None or not self._is_diff_too_large(err.response):
+                raise
+            print("    ⚠️  PR diff endpoint exceeded GitHub line cap (20k). Falling back ...")
+
+        if base_sha and head_sha:
+            try:
+                return self._get_compare_diff(owner, repo, base_sha, head_sha), "compare_endpoint"
+            except requests.HTTPError as err:
+                code = err.response.status_code if err.response is not None else "unknown"
+                print(f"    ⚠️  Compare diff fallback failed (HTTP {code}).")
+
+        if files is not None:
+            return synthesize_diff_from_files(files), "synthesized_from_files"
+
+        raise RuntimeError("Unable to fetch diff from GitHub API and no file data available.")
 
 
 # ─── Data Fetching ───────────────────────────────────────────────────────────
@@ -143,10 +201,18 @@ def fetch_all_pr_data(client: GitHubClient, owner: str, repo: str, pr_num: int) 
     review_cmts = client.get_paginated(f"{base}/pulls/{pr_num}/comments")
     commits     = client.get_paginated(f"{base}/pulls/{pr_num}/commits")
     labels      = pr.get("labels", [])
-    diff        = client.get_diff(owner, repo, pr_num)
+    diff, diff_source = client.get_diff(
+        owner,
+        repo,
+        pr_num,
+        base_sha=pr["base"]["sha"],
+        head_sha=pr["head"]["sha"],
+        files=files,
+    )
 
     print(f"    ✓ Metadata, {len(files)} files, {len(commits)} commits, "
           f"{len(reviews)} reviews, {len(comments) + len(review_cmts)} comments")
+    print(f"    ✓ Diff source: {diff_source}")
 
     return {
         "pr": pr,
@@ -157,6 +223,7 @@ def fetch_all_pr_data(client: GitHubClient, owner: str, repo: str, pr_num: int) 
         "commits": commits,
         "labels": labels,
         "diff": diff,
+        "diff_source": diff_source,
     }
 
 
@@ -182,6 +249,56 @@ def wrap_diff(patch: str | None) -> str:
     if not patch:
         return "_No diff available (binary file or file moved without changes)_"
     return f"```diff\n{patch}\n```"
+
+def synthesize_diff_from_files(files: list[dict]) -> str:
+    """
+    Build an approximate unified diff by stitching together /pulls/{pr}/files patches.
+    This fallback keeps the export running when GitHub refuses full PR diff media type.
+    """
+    lines: list[str] = []
+    missing_patch_count = 0
+
+    for f in files:
+        filename = f["filename"]
+        status = f.get("status", "modified")
+        previous_filename = f.get("previous_filename", filename)
+        old_path = previous_filename if status == "renamed" else filename
+        patch = f.get("patch")
+
+        lines.append(f"diff --git a/{old_path} b/{filename}")
+        if status == "added":
+            lines.append("new file mode 100644")
+            before, after = "/dev/null", f"b/{filename}"
+        elif status == "removed":
+            lines.append("deleted file mode 100644")
+            before, after = f"a/{old_path}", "/dev/null"
+        elif status == "renamed":
+            lines.append(f"rename from {previous_filename}")
+            lines.append(f"rename to {filename}")
+            before, after = f"a/{previous_filename}", f"b/{filename}"
+        else:
+            before, after = f"a/{old_path}", f"b/{filename}"
+
+        lines.append(f"--- {before}")
+        lines.append(f"+++ {after}")
+
+        if patch:
+            lines.append(patch.rstrip("\n"))
+        else:
+            missing_patch_count += 1
+            lines.append("@@ -0,0 +0,0 @@")
+            lines.append(
+                f"# Patch omitted by GitHub API for {filename} "
+                f"(status={status}, additions={f.get('additions', 0)}, deletions={f.get('deletions', 0)})."
+            )
+
+        lines.append("")
+
+    summary = (
+        "# Synthesized fallback diff from /pulls/{pr}/files.\n"
+        f"# Files with omitted patch text: {missing_patch_count}.\n\n"
+    )
+    return summary + "\n".join(lines)
 
 def render_markdown(data: dict, owner: str, repo: str, pr_num: int) -> str:
     pr  = data["pr"]
@@ -301,12 +418,21 @@ def render_markdown(data: dict, owner: str, repo: str, pr_num: int) -> str:
 
     # ── Full Raw Diff ─────────────────────────────────────────────────────────
     W("## 📄 Full Raw Diff\n")
-    W("<details>")
-    W("<summary>Click to expand full unified diff</summary>\n")
-    W("```diff")
-    W(data["diff"])
-    W("```")
-    W("</details>\n")
+    diff = data["diff"]
+    diff_source = data.get("diff_source", "unknown")
+    diff_lines = diff.count("\n") + 1 if diff else 0
+    W(f"_Source: `{diff_source}` · lines: `{diff_lines}`_\n")
+    if diff_lines > 25000:
+        W(
+            "_Diff is very large, so it is stored in `changes.diff` and not embedded here to keep the markdown usable._\n"
+        )
+    else:
+        W("<details>")
+        W("<summary>Click to expand full unified diff</summary>\n")
+        W("```diff")
+        W(diff)
+        W("```")
+        W("</details>\n")
 
     # ── Reviews ───────────────────────────────────────────────────────────────
     reviews = data["reviews"]
